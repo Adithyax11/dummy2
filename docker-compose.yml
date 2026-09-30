@@ -1,0 +1,71 @@
+services:
+  gateway:
+    build: ./gateway
+    ports:
+      - "8000:8000"
+    environment:
+      USER_SERVICE_URL: http://user-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      JWT_SECRET: change-this-to-a-long-random-string
+      CORS_ORIGINS: http://localhost:5173,http://localhost:3000
+    depends_on:
+      user-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+    networks: [app-net]
+
+  user-service:
+    build: ./user-service
+    expose: ["8000"]
+    environment:
+      DB_PATH: /data/users.db
+      JWT_SECRET: change-this-to-a-long-random-string
+      JWT_EXPIRE_SECONDS: "3600"
+    volumes:
+      - user-data:/data
+    healthcheck: &hc
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks: [app-net]
+
+  order-service:
+    build: ./order-service
+    expose: ["8000"]
+    environment:
+      DB_PATH: /data/orders.db
+      INTERNAL_API_KEY: change-this-internal-key
+    volumes:
+      - order-data:/data
+    healthcheck: *hc
+    networks: [app-net]
+
+  payment-service:
+    build: ./payment-service
+    expose: ["8000"]
+    environment:
+      DB_PATH: /data/payments.db
+      ORDER_SERVICE_URL: http://order-service:8000
+      INTERNAL_API_KEY: change-this-internal-key
+    volumes:
+      - payment-data:/data
+    depends_on:
+      order-service:
+        condition: service_healthy
+    healthcheck: *hc
+    networks: [app-net]
+
+volumes:
+  user-data:
+  order-data:
+  payment-data:
+
+networks:
+  app-net:
+    driver: bridge
