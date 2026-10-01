@@ -1,0 +1,31 @@
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: none
+  OTEL_LOGS_EXPORTER: none
+
+services:
+  gateway:
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: gateway
+    command: ["sh", "-c", "pip install -q opentelemetry-distro opentelemetry-exporter-otlp && opentelemetry-bootstrap -a install && opentelemetry-instrument uvicorn main:app --host 0.0.0.0 --port 8000"]
+
+  user-service:
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: user-service
+    command: ["sh", "-c", "pip install -q opentelemetry-distro opentelemetry-exporter-otlp && opentelemetry-bootstrap -a install && opentelemetry-instrument uvicorn main:app --host 0.0.0.0 --port 8000"]
+
+  order-service:
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: order-service
+    command: ["sh", "-c", "pip install -q opentelemetry-distro opentelemetry-exporter-otlp && opentelemetry-bootstrap -a install && opentelemetry-instrument uvicorn main:app --host 0.0.0.0 --port 8000"]
+
+  payment-service:
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: payment-service
+    command: ["sh", "-c", "pip install -q opentelemetry-distro opentelemetry-exporter-otlp && opentelemetry-bootstrap -a install && opentelemetry-instrument uvicorn main:app --host 0.0.0.0 --port 8000"]
