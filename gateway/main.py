@@ -1,11 +1,20 @@
+import contextvars
+import logging
 import os
+import time
+import uuid
 
 import httpx
 import jwt
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+SERVICE = "gateway"
+
+JWT_SECRET = os.environ["JWT_SECRET"]
+if len(JWT_SECRET) < 32:
+    raise RuntimeError("JWT_SECRET must be at least 32 characters (set it in .env)")
 JWT_ALGO = "HS256"
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")]
 
@@ -30,8 +39,36 @@ HOP_BY_HOP = {
     "te", "trailers", "transfer-encoding", "upgrade",
 }
 # never trust these from the client, the gateway sets them itself
-STRIP_REQUEST = HOP_BY_HOP | {"host", "content-length", "x-user-id", "x-username", "x-internal-key"}
+STRIP_REQUEST = HOP_BY_HOP | {
+    "host", "content-length", "x-user-id", "x-username", "x-internal-key", "x-request-id",
+}
 STRIP_RESPONSE = HOP_BY_HOP | {"content-length", "content-encoding", "content-type"}
+
+
+# ---------- logging ----------
+request_id_var = contextvars.ContextVar("request_id", default="-")
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = request_id_var.get()
+        return True
+
+
+def setup_logging():
+    handler = logging.StreamHandler()
+    handler.addFilter(RequestIdFilter())
+    handler.setFormatter(
+        logging.Formatter(f"%(asctime)s %(levelname)s [{SERVICE}] [%(request_id)s] %(message)s")
+    )
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    logging.getLogger("uvicorn.access").disabled = True
+
+
+setup_logging()
+logger = logging.getLogger(SERVICE)
 
 app = FastAPI(title="API Gateway")
 
@@ -41,7 +78,26 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
+
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    rid = uuid.uuid4().hex[:12]  # always generated here, never taken from the client
+    token = request_id_var.set(rid)
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("unhandled error on %s %s", request.method, request.url.path)
+        response = JSONResponse({"detail": "Internal server error"}, status_code=500)
+    ms = (time.perf_counter() - start) * 1000
+    if request.url.path != "/health":
+        logger.info("%s %s -> %s (%.0f ms)", request.method, request.url.path, response.status_code, ms)
+    response.headers["X-Request-ID"] = rid
+    request_id_var.reset(token)
+    return response
 
 
 # ---------- auth ----------
@@ -50,7 +106,9 @@ def verify_token(request: Request) -> dict:
     if scheme.lower() != "bearer" or not token:
         raise HTTPException(status_code=401, detail="Missing bearer token")
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return jwt.decode(
+            token, JWT_SECRET, algorithms=[JWT_ALGO], options={"require": ["exp", "sub"]}
+        )
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
@@ -60,7 +118,7 @@ def verify_token(request: Request) -> dict:
 # ---------- health ----------
 @app.get("/health")
 def health():
-    return {"service": "gateway", "status": "ok"}
+    return {"service": SERVICE, "status": "ok"}
 
 
 @app.get("/health/all")
@@ -92,6 +150,7 @@ async def proxy(prefix: str, path: str, request: Request) -> Response:
         raise HTTPException(status_code=400, detail="Bad path")
 
     headers = {k: v for k, v in request.headers.items() if k.lower() not in STRIP_REQUEST}
+    headers["X-Request-ID"] = request_id_var.get()
 
     if (prefix, path) not in PUBLIC:
         claims = verify_token(request)
@@ -110,7 +169,8 @@ async def proxy(prefix: str, path: str, request: Request) -> Response:
                 headers=headers,
                 content=body,
             )
-    except httpx.RequestError:
+    except httpx.RequestError as e:
+        logger.warning("%s service unreachable: %s", prefix, e)
         raise HTTPException(status_code=502, detail=f"{prefix} service unavailable")
 
     resp_headers = {k: v for k, v in r.headers.items() if k.lower() not in STRIP_RESPONSE}

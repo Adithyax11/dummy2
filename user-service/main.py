@@ -1,19 +1,71 @@
+import contextvars
+import logging
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 
 import bcrypt
 import jwt
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+SERVICE = "user-service"
+
 DB_PATH = os.getenv("DB_PATH", "/data/users.db")
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_SECRET = os.environ["JWT_SECRET"]
+if len(JWT_SECRET) < 32:
+    raise RuntimeError("JWT_SECRET must be at least 32 characters (set it in .env)")
 JWT_ALGO = "HS256"
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "3600"))
 
+
+# ---------- logging ----------
+request_id_var = contextvars.ContextVar("request_id", default="-")
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = request_id_var.get()
+        return True
+
+
+def setup_logging():
+    handler = logging.StreamHandler()
+    handler.addFilter(RequestIdFilter())
+    handler.setFormatter(
+        logging.Formatter(f"%(asctime)s %(levelname)s [{SERVICE}] [%(request_id)s] %(message)s")
+    )
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    logging.getLogger("uvicorn.access").disabled = True
+
+
+setup_logging()
+logger = logging.getLogger(SERVICE)
+
 app = FastAPI(title="User Service")
+
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    rid = (request.headers.get("x-request-id") or uuid.uuid4().hex[:12])[:64]
+    token = request_id_var.set(rid)
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("unhandled error on %s %s", request.method, request.url.path)
+        response = JSONResponse({"detail": "Internal server error"}, status_code=500)
+    ms = (time.perf_counter() - start) * 1000
+    if request.url.path != "/health":
+        logger.info("%s %s -> %s (%.0f ms)", request.method, request.url.path, response.status_code, ms)
+    response.headers["X-Request-ID"] = rid
+    request_id_var.reset(token)
+    return response
 
 
 # ---------- database ----------
@@ -94,7 +146,7 @@ def decode_token(token: str) -> dict:
 # ---------- routes ----------
 @app.get("/health")
 def health():
-    return {"service": "user-service", "status": "ok"}
+    return {"service": SERVICE, "status": "ok"}
 
 
 @app.post("/register", status_code=201)
@@ -108,6 +160,7 @@ def register(body: RegisterRequest):
             (body.username, body.email.lower()),
         ).fetchone()
         if exists:
+            logger.info("register rejected (duplicate) username=%r", body.username)
             raise HTTPException(status_code=409, detail="Username or email already taken")
 
         cur = db.execute(
@@ -116,6 +169,7 @@ def register(body: RegisterRequest):
         )
         user_id = cur.lastrowid
 
+    logger.info("user registered id=%s username=%r", user_id, body.username)
     return {"id": user_id, "username": body.username, "email": body.email.lower()}
 
 
@@ -127,8 +181,10 @@ def login(body: LoginRequest):
         ).fetchone()
 
     if not user or not verify_password(body.password, user["password_hash"]):
+        logger.warning("failed login username=%r", body.username)
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
+    logger.info("login ok user_id=%s", user["id"])
     return {
         "access_token": create_token(user["id"], user["username"]),
         "token_type": "bearer",

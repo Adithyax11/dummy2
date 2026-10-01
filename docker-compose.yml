@@ -1,14 +1,16 @@
 services:
   gateway:
     build: ./gateway
+    restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
       USER_SERVICE_URL: http://user-service:8000
       ORDER_SERVICE_URL: http://order-service:8000
       PAYMENT_SERVICE_URL: http://payment-service:8000
-      JWT_SECRET: change-this-to-a-long-random-string
-      CORS_ORIGINS: http://localhost:5173,http://localhost:3000
+      JWT_SECRET: "${JWT_SECRET:?Set JWT_SECRET in .env}"
+      CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     depends_on:
       user-service:
         condition: service_healthy
@@ -20,11 +22,13 @@ services:
 
   user-service:
     build: ./user-service
+    restart: unless-stopped
     expose: ["8000"]
     environment:
       DB_PATH: /data/users.db
-      JWT_SECRET: change-this-to-a-long-random-string
-      JWT_EXPIRE_SECONDS: "3600"
+      JWT_SECRET: "${JWT_SECRET:?Set JWT_SECRET in .env}"
+      JWT_EXPIRE_SECONDS: "${JWT_EXPIRE_SECONDS:-3600}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     volumes:
       - user-data:/data
     healthcheck: &hc
@@ -37,10 +41,12 @@ services:
 
   order-service:
     build: ./order-service
+    restart: unless-stopped
     expose: ["8000"]
     environment:
       DB_PATH: /data/orders.db
-      INTERNAL_API_KEY: change-this-internal-key
+      INTERNAL_API_KEY: "${INTERNAL_API_KEY:?Set INTERNAL_API_KEY in .env}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     volumes:
       - order-data:/data
     healthcheck: *hc
@@ -48,17 +54,34 @@ services:
 
   payment-service:
     build: ./payment-service
+    restart: unless-stopped
     expose: ["8000"]
     environment:
       DB_PATH: /data/payments.db
       ORDER_SERVICE_URL: http://order-service:8000
-      INTERNAL_API_KEY: change-this-internal-key
+      INTERNAL_API_KEY: "${INTERNAL_API_KEY:?Set INTERNAL_API_KEY in .env}"
+      RECONCILE_INTERVAL: "${RECONCILE_INTERVAL:-30}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     volumes:
       - payment-data:/data
     depends_on:
       order-service:
         condition: service_healthy
     healthcheck: *hc
+    networks: [app-net]
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - gateway
     networks: [app-net]
 
 volumes:

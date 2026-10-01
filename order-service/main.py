@@ -1,22 +1,74 @@
+import contextvars
+import logging
 import os
 import secrets
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from typing import Literal, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+SERVICE = "order-service"
+
 DB_PATH = os.getenv("DB_PATH", "/data/orders.db")
-INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "dev-internal-key")
+INTERNAL_API_KEY = os.environ["INTERNAL_API_KEY"]
+if len(INTERNAL_API_KEY) < 32:
+    raise RuntimeError("INTERNAL_API_KEY must be at least 32 characters (set it in .env)")
 
 STATUSES = {"pending", "paid", "failed", "cancelled"}
 CANCELLABLE = {"pending", "failed"}
 # status changes the payment service is allowed to make
 ALLOWED_TRANSITIONS = {"pending": {"paid", "failed"}, "failed": {"paid", "failed"}}
 
+
+# ---------- logging ----------
+request_id_var = contextvars.ContextVar("request_id", default="-")
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = request_id_var.get()
+        return True
+
+
+def setup_logging():
+    handler = logging.StreamHandler()
+    handler.addFilter(RequestIdFilter())
+    handler.setFormatter(
+        logging.Formatter(f"%(asctime)s %(levelname)s [{SERVICE}] [%(request_id)s] %(message)s")
+    )
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    logging.getLogger("uvicorn.access").disabled = True
+
+
+setup_logging()
+logger = logging.getLogger(SERVICE)
+
 app = FastAPI(title="Order Service")
+
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    rid = (request.headers.get("x-request-id") or uuid.uuid4().hex[:12])[:64]
+    token = request_id_var.set(rid)
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("unhandled error on %s %s", request.method, request.url.path)
+        response = JSONResponse({"detail": "Internal server error"}, status_code=500)
+    ms = (time.perf_counter() - start) * 1000
+    if request.url.path != "/health":
+        logger.info("%s %s -> %s (%.0f ms)", request.method, request.url.path, response.status_code, ms)
+    response.headers["X-Request-ID"] = rid
+    request_id_var.reset(token)
+    return response
 
 
 # ---------- database ----------
@@ -78,6 +130,7 @@ def require_internal_key(x_internal_key: Optional[str]):
     if not x_internal_key or not secrets.compare_digest(
         x_internal_key.encode(), INTERNAL_API_KEY.encode()
     ):
+        logger.warning("internal route called with a bad key")
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
@@ -88,7 +141,7 @@ def row_to_order(row: sqlite3.Row) -> dict:
 # ---------- routes ----------
 @app.get("/health")
 def health():
-    return {"service": "order-service", "status": "ok"}
+    return {"service": SERVICE, "status": "ok"}
 
 
 @app.post("/", status_code=201)
@@ -107,6 +160,7 @@ def create_order(body: OrderCreate, x_user_id: Optional[str] = Header(default=No
         )
         order = db.execute("SELECT * FROM orders WHERE id = ?", (cur.lastrowid,)).fetchone()
 
+    logger.info("order created id=%s user_id=%s total=%s", order["id"], user_id, total)
     return row_to_order(order)
 
 
@@ -173,6 +227,7 @@ def cancel_order(order_id: int, x_user_id: Optional[str] = Header(default=None))
         )
         order = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
 
+    logger.info("order cancelled id=%s user_id=%s", order_id, user_id)
     return row_to_order(order)
 
 
@@ -190,16 +245,22 @@ def internal_update_status(
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
+        # idempotent: asking for the status it already has is a success
+        if order["status"] == body.status:
+            return row_to_order(order)
+
         if body.status not in ALLOWED_TRANSITIONS.get(order["status"], set()):
             raise HTTPException(
                 status_code=409,
                 detail=f"Cannot change status from {order['status']} to {body.status}",
             )
 
+        old_status = order["status"]
         db.execute(
             "UPDATE orders SET status = ?, updated_at = ? WHERE id = ?",
             (body.status, int(time.time()), order_id),
         )
         order = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
 
+    logger.info("order %s status %s -> %s", order_id, old_status, body.status)
     return row_to_order(order)
